@@ -1,0 +1,21 @@
+name: English maintenance coverage
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test the exact exception guard
+        run: node tools/english-audit.mjs --self-test
+      - name: Reject unreviewed technical prose and stale exceptions
+        run: node tools/english-audit.mjs

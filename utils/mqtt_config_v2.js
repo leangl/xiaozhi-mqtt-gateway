@@ -19,54 +19,54 @@ function generatePasswordSignature(content, secretKey) {
 }
 
 function validateMqttCredentials(clientId, username, password, realClientIp = null) {
-    // 验证密码签名
+    // Validate the password signature
     const signatureKey = process.env.MQTT_SIGNATURE_KEY;
     if (signatureKey) {
         const expectedSignature = generatePasswordSignature(clientId + '|' + username, signatureKey);
         if (password !== expectedSignature) {
-            throw new Error('密码签名验证失败');
+            throw new Error('Password signature verification failed');
         }
     } else {
-        console.warn('缺少MQTT_SIGNATURE_KEY环境变量，跳过密码签名验证');
+        console.warn('MQTT_SIGNATURE_KEY environment variable is missing; skipping password signature verification');
     }
 
-    // 验证clientId
+    // Validate clientId
     if (!clientId || typeof clientId !== 'string') {
-        throw new Error('clientId必须是非空字符串');
+        throw new Error('clientId must be a non-empty string');
     }
 
-    // 验证clientId格式（必须包含@@@分隔符）
+    // Validate the clientId format (must contain @@@ separators)
     const clientIdParts = clientId.split('@@@');
-    // 新版本 MQTT 参数
+    // New-version MQTT parameters
     if (clientIdParts.length !== 3) {
-        throw new Error('clientId格式错误，必须包含@@@分隔符');
+        throw new Error('Invalid clientId format; @@@ separators are required');
     }
 
-    // 验证username
+    // Validate username
     if (!username || typeof username !== 'string') {
-        throw new Error('username必须是非空字符串');
+        throw new Error('username must be a non-empty string');
     }
 
-    // 尝试解码username（应该是base64编码的JSON）
+    // Decode username, which should contain Base64-encoded JSON
     let userData;
     try {
         const decodedUsername = Buffer.from(username, 'base64').toString();
         userData = JSON.parse(decodedUsername);
     } catch (error) {
-        throw new Error('username不是有效的base64编码JSON');
+        throw new Error('username is not valid Base64-encoded JSON');
     }
 
-    // 如果有真实IP，使用真实IP覆盖客户端提供的IP
+    // Override the client-supplied IP with the actual IP when available
     if (realClientIp) {
-        // 处理IPv6映射的IPv4地址 (::ffff:192.168.1.1 -> 192.168.1.1)
+        // Handle IPv4-mapped IPv6 addresses (::ffff:192.168.1.1 -> 192.168.1.1)
         const cleanIp = realClientIp.replace(/^::ffff:/, '');
         userData.ip = cleanIp;
     }
 
-    // 解析clientId中的信息
+    // Parse the clientId fields
     const [groupId, macAddress, uuid] = clientIdParts;
 
-    // 如果验证成功，返回解析后的有用信息
+    // Return parsed fields after successful validation
     return {
         groupId,
         macAddress: macAddress.replace(/_/g, ':'),
@@ -93,7 +93,7 @@ function generateMqttConfig(groupId, macAddress, uuid, userData) {
         username,
         password,
         publish_topic: 'device-server',
-        subscribe_topic: 'null' // 旧版本固件不返回此字段会出错
+        subscribe_topic: 'null' // Older firmware fails if this field is omitted
     }
 }
 

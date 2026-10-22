@@ -1,7 +1,7 @@
 {
   "name": "xiaozhi-mqtt-gateway",
   "version": "1.0.0",
-  "description": "一个简单的 MQTT 服务器实现，支持 QoS 0",
+  "description": "A simple MQTT server implementation with QoS 0 support",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"

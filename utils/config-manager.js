@@ -1,60 +1,49 @@
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
+const { validateServerPools } = require('./service-policy');
 
 class ConfigManager extends EventEmitter {
   constructor(fileName) {
     super();
-    this.config = {};  // 移除默认的 apiKeys 配置
+    this.config = null;  // No routing is ready until a complete candidate validates.
     this.configPath = path.join(__dirname, "..", "config", fileName);
+    this.watchDebounceTimer = null;
     this.loadConfig();
     this.watchConfig();
-    // 添加防抖计时器变量
-    this.watchDebounceTimer = null;
   }
 
   loadConfig() {
     try {
       const data = fs.readFileSync(this.configPath, 'utf8');
-      const newConfig = JSON.parse(data);
+      const newConfig = validateServerPools(JSON.parse(data));
       
-      // 检测配置是否发生变化
+      // Check whether the configuration changed
       if (JSON.stringify(this.config) !== JSON.stringify(newConfig)) {
-        console.log('配置已更新', this.configPath);
+        console.log('Configuration updated');
         this.config = newConfig;
-        // 发出配置更新事件
+        // Emit the configuration update event
         this.emit('configChanged', this.config);
       }
-    } catch (error) {
-      console.error('加载配置出错:', error, this.configPath);
-      if (error.code === 'ENOENT') {
-        this.createEmptyConfig();
+      return true;
+    } catch {
+      if (!this.isReady()) {
+        console.error('Gateway configuration unavailable; service is unready');
+        throw new Error('GATEWAY_CONFIG_UNREADY');
       }
-    }
-  }
-
-  createEmptyConfig() {
-    try {
-      const dir = path.dirname(this.configPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      const defaultConfig = {};  // 空配置对象
-      fs.writeFileSync(this.configPath, JSON.stringify(defaultConfig, null, 2));
-      console.log('已创建空配置文件', this.configPath);
-    } catch (error) {
-      console.error('创建空配置文件出错:', error, this.configPath);
+      console.error('Configuration reload rejected; keeping last valid configuration');
+      return false;
     }
   }
 
   watchConfig() {
     fs.watch(path.dirname(this.configPath), (eventType, filename) => {
-      if (filename === path.basename(this.configPath) && eventType === 'change') {
-        // 清除之前的计时器
+      if (filename === path.basename(this.configPath) && ['change', 'rename'].includes(eventType)) {
+        // Clear the previous timer
         if (this.watchDebounceTimer) {
           clearTimeout(this.watchDebounceTimer);
         }
-        // 设置新的计时器，300ms 后执行
+        // Set a new timer to run after 300ms
         this.watchDebounceTimer = setTimeout(() => {
           this.loadConfig();
         }, 300);
@@ -62,12 +51,16 @@ class ConfigManager extends EventEmitter {
     });
   }
 
-  // 获取配置的方法
+  isReady() {
+    return this.config !== null;
+  }
+
+  // Get the configuration
   getConfig() {
     return this.config;
   }
 
-  // 获取特定配置项的方法
+  // Get a specific configuration value
   get(key) {
     return this.config[key];
   }

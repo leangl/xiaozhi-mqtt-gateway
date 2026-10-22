@@ -1,4 +1,4 @@
-// Description: MQTT+UDP 到 WebSocket 的桥接
+// Description: Bridge MQTT+UDP to WebSocket
 // Author: terrence@tenclass.com
 // Date: 2025-03-12
 
@@ -14,15 +14,19 @@ const { MQTTProtocol } = require('./mqtt-protocol');
 const { ConfigManager } = require('./utils/config-manager');
 const { CallManager } = require('./utils/call-manager');
 const { validateMqttCredentials } = require('./utils/mqtt_config_v2');
+const { validatePublicIp, voiceSocketOptions } = require('./utils/service-policy');
 
-// libopus-wasm 编码器缓存（用于生成静音帧）
+// Fail before opening listeners; never silently advertise a public fallback.
+const publicIp = validatePublicIp(process.env.PUBLIC_IP);
+
+// Cache the libopus-wasm encoder used to generate silence frames
 let opusEncoderPromise = null;
 let opusEncoder = null;
-let cachedSilenceFrame = null;  // 预编码的静音帧，启动时生成
+let cachedSilenceFrame = null;  // Pre-encoded silence frame generated at startup
 
 async function warmupOpusEncoder() {
     const encoder = await getOpusEncoder();
-    // 预编码一个静音帧缓存起来，发送时直接用
+    // Pre-encode and cache a silence frame for reuse when sending
     const silentPCM = new Int16Array(960);
     const encoded = encoder.encode(silentPCM, { frameSize: 960 });
     cachedSilenceFrame = Buffer.from(encoded);
@@ -49,10 +53,6 @@ function generateOpusSilenceFrame() {
     return cachedSilenceFrame;
 }
 
-// 确保编码器已初始化（启动时调用一次）
-warmupOpusEncoder().catch(e => console.error('OPUS encoder init failed:', e));
-
-
 function setDebugEnabled(enabled) {
     if (enabled) {
         debugModule.enable('mqtt-server');
@@ -67,6 +67,8 @@ configManager.on('configChanged', (config) => {
 });
 
 setDebugEnabled(configManager.get('debug'));
+// Initialize only after startup policy and routing configuration are valid.
+warmupOpusEncoder().catch(() => console.error('OPUS encoder init failed'));
 
 class WebSocketBridge extends Emitter {
     constructor(connection, protocolVersion, macAddress, uuid, userData) {
@@ -89,15 +91,15 @@ class WebSocketBridge extends Emitter {
         } else {
             chatServers = configManager.get('production')?.chat_servers;
         }
-        if (!chatServers) {
-            throw new Error(`未找到 ${this.macAddress} 的聊天服务器`);
+        if (!Array.isArray(chatServers) || chatServers.length === 0) {
+            throw new Error('GATEWAY_CONFIG_UNREADY');
         }
         this.chatServer = chatServers[Math.floor(Math.random() * chatServers.length)];
     }
 
     async connect(audio_params, features) {
         return new Promise((resolve, reject) => {
-            // 生成WebSocket认证token
+            // Generate the WebSocket authentication token
             let authorization = "test-token";
             const serverSecret = process.env.SERVER_SECRET;
             if (serverSecret) {
@@ -105,18 +107,18 @@ class WebSocketBridge extends Emitter {
                 const username = this.macAddress;
                 const timestamp = Math.floor(Date.now() / 1000);
 
-                // 构建签名内容: clientId|username|timestamp
+                // Build the signed content: clientId|username|timestamp
                 const content = `${clientId}|${username}|${timestamp}`;
 
-                // 生成HMAC-SHA256签名
+                // Generate the HMAC-SHA256 signature
                 const hmac = crypto.createHmac('sha256', serverSecret);
                 hmac.update(content);
                 const signature = hmac.digest();
 
-                // Base64 URL-safe编码签名(去除填充符=)
+                // Encode the signature as URL-safe Base64 without = padding
                 const signatureBase64 = signature.toString('base64url');
 
-                // 生成认证token: signature.timestamp
+                // Build the authentication token: signature.timestamp
                 authorization = `${signatureBase64}.${timestamp}`;
             }
 
@@ -131,7 +133,14 @@ class WebSocketBridge extends Emitter {
             if (this.userData && this.userData.ip) {
                 headers['x-forwarded-for'] = this.userData.ip;
             }
-            this.wsClient = new WebSocket(this.chatServer, { headers });
+            try {
+                // Revalidate immediately before construction, including after reloads.
+                this.wsClient = new WebSocket(this.chatServer, voiceSocketOptions(this.chatServer, headers));
+            } catch {
+                console.error('Voice WebSocket connection rejected');
+                reject(new Error('VOICE_CONNECTION_REJECTED'));
+                return;
+            }
 
             this.wsClient.on('open', () => {
                 this.sendJson({
@@ -148,10 +157,10 @@ class WebSocketBridge extends Emitter {
                     const timestamp = data.readUInt32BE(8);
                     const opusLength = data.readUInt32BE(12);
                     const opus = data.subarray(16, 16 + opusLength);
-                    // 二进制数据通过UDP发送
+                    // Send binary data over UDP
                     this.connection.sendUdpMessage(opus, timestamp);
                 } else {
-                    // JSON数据通过MQTT发送
+                    // Send JSON data over MQTT
                     const message = JSON.parse(data.toString());
                     if (message.type === 'hello') {
                         resolve(message);
@@ -165,10 +174,10 @@ class WebSocketBridge extends Emitter {
                 }
             });
 
-            this.wsClient.on('error', (error) => {
-                console.error(`WebSocket error for device ${this.macAddress}:`, error);
+            this.wsClient.on('error', () => {
+                console.error('Voice WebSocket connection failed');
                 this.emit('close');
-                reject(error);
+                reject(new Error('VOICE_CONNECTION_FAILED'));
             });
 
             this.wsClient.on('close', () => {
@@ -191,7 +200,7 @@ class WebSocketBridge extends Emitter {
             buffer.set(opus, 16);
             this.wsClient.send(buffer, { binary: true });
         } else {
-            console.error(`WebSocket连接不可用，无法发送音频数据`);
+            console.error(`WebSocket connection unavailable; cannot send audio data`);
         }
     }
 
@@ -210,8 +219,8 @@ class WebSocketBridge extends Emitter {
 const MacAddressRegex = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/;
 
 /**
- * MQTT连接类
- * 负责应用层逻辑处理
+ * MQTT connection
+ * Handle application-layer logic
  */
 class MQTTConnection {
     constructor(socket, connectionId, server) {
@@ -230,17 +239,17 @@ class MQTTConnection {
         this.headerBuffer = Buffer.alloc(16);
         this.mcpPendingRequests = {};
 
-        // 提取真实的客户端IP
+        // Read the actual client IP
         this.realClientIp = socket.remoteAddress;
 
-        // 创建协议处理器，并传入socket
+        // Create the protocol handler with this socket
         this.protocol = new MQTTProtocol(socket, configManager);
 
         this.setupProtocolHandlers();
     }
 
     setupProtocolHandlers() {
-        // 设置协议事件处理
+        // Register protocol event handlers
         this.protocol.on('connect', (connectData) => {
             this.handleConnect(connectData);
         });
@@ -258,17 +267,17 @@ class MQTTConnection {
         });
 
         this.protocol.on('close', () => {
-            debug(`${this.clientId} 客户端断开连接`);
+            debug(`${this.clientId} client disconnected`);
             this.server.removeConnection(this);
         });
 
         this.protocol.on('error', (err) => {
-            debug(`${this.clientId} 连接错误:`, err);
+            debug(`${this.clientId} connection error:`, err);
             this.close();
         });
 
         this.protocol.on('protocolError', (err) => {
-            debug(`${this.clientId} 协议错误:`, err);
+            debug(`${this.clientId} protocol error:`, err);
             this.close();
         });
     }
@@ -278,10 +287,9 @@ class MQTTConnection {
         this.username = connectData.username;
         this.password = connectData.password;
 
-        debug('客户端连接:', {
+        debug('Client connected:', {
             clientId: this.clientId,
             username: this.username,
-            password: this.password,
             protocol: connectData.protocol,
             protocolLevel: connectData.protocolLevel,
             keepAlive: connectData.keepAlive
@@ -298,12 +306,12 @@ class MQTTConnection {
             this.groupId = parts[0];
             this.macAddress = parts[1].replace(/_/g, ':');
             if (!MacAddressRegex.test(this.macAddress)) {
-                debug('无效的 macAddress:', this.macAddress);
+                debug('Invalid macAddress:', this.macAddress);
                 this.close();
                 return;
             }
         } else {
-            debug('无效的 clientId:', this.clientId);
+            debug('Invalid clientId:', this.clientId);
             this.close();
             return;
         }
@@ -314,34 +322,34 @@ class MQTTConnection {
     }
 
     handleSubscribe(subscribeData) {
-        debug('客户端订阅主题:', {
+        debug('Client subscribed to topic:', {
             clientId: this.clientId,
             topic: subscribeData.topic,
             packetId: subscribeData.packetId
         });
 
-        // 发送 SUBACK
+        // Send SUBACK
         this.protocol.sendSuback(subscribeData.packetId, 0);
     }
 
     handleDisconnect() {
-        debug('收到断开连接请求:', { clientId: this.clientId });
-        // 清理连接
+        debug('Received disconnect request:', { clientId: this.clientId });
+        // Clean up the connection
         this.server.removeConnection(this);
     }
 
     close() {
         this.closing = true;
-        // 清理所有未完成的 MCP 请求
+        // Clean up all pending MCP requests
         for (const request of Object.values(this.mcpPendingRequests)) {
             request.reject(new Error('Connection closed'));
         }
         this.mcpPendingRequests = {};
 
-        // 清理设备通话状态
+        // Clear the device's call state
         if (this.macAddress) {
             const peerConn = this.server.callManager.getPeerConnection(this.macAddress);
-            // 必须先获取session_id，再调用clearDevice（因为clearDevice会删除callSessionIds）
+            // Get session_id before clearDevice, which deletes callSessionIds
             const peerSessionId = peerConn ? this.server.callManager.getCallSessionId(peerConn.macAddress) : null;
             this.server.callManager.clearDevice(this.macAddress);
             if (peerConn && peerSessionId) {
@@ -361,21 +369,21 @@ class MQTTConnection {
         const now = Date.now();
         const keepAliveInterval = this.protocol.getKeepAliveInterval();
 
-        // 如果keepAliveInterval为0，表示不需要心跳检查
+        // A keepAliveInterval of 0 disables keep-alive checks
         if (keepAliveInterval === 0 || !this.protocol.isConnected) return;
 
         const lastActivity = this.protocol.getLastActivity();
         const timeSinceLastActivity = now - lastActivity;
 
-        // 如果超过心跳间隔，关闭连接
+        // Close the connection if the keep-alive interval has elapsed
         if (timeSinceLastActivity > keepAliveInterval) {
-            debug('心跳超时，关闭连接:', this.clientId);
+            debug('Keep-alive timed out; closing connection:', this.clientId);
             this.close();
         }
     }
 
     handlePublish(publishData) {
-        debug('收到发布消息:', {
+        debug('Received publish message:', {
             clientId: this.clientId,
             topic: publishData.topic,
             payload: publishData.payload,
@@ -383,7 +391,7 @@ class MQTTConnection {
         });
 
         if (publishData.qos !== 0) {
-            debug('不支持的 QoS 级别:', publishData.qos, '关闭连接');
+            debug('Unsupported QoS level:', publishData.qos, 'Closing connection');
             this.close();
             return;
         }
@@ -391,30 +399,30 @@ class MQTTConnection {
         const json = JSON.parse(publishData.payload);
         if (json.type === 'hello') {
             if (json.version !== 3) {
-                debug('不支持的协议版本:', json.version, '关闭连接');
+                debug('Unsupported protocol version:', json.version, 'Closing connection');
                 this.close();
                 return;
             }
             this.parseHelloMessage(json).catch(error => {
-                debug('处理 hello 消息失败:', error);
+                debug('Failed to handle hello message:', error);
                 this.close();
             });
         } else {
             this.parseOtherMessage(json).catch(error => {
-                debug('处理其他消息失败:', error);
+                debug('Failed to handle other message:', error);
                 this.close();
             });
         }
     }
 
     sendMqttMessage(payload) {
-        debug(`发送消息到 ${this.replyTo}: ${payload}`);
+        debug(`Sending message to ${this.replyTo}: ${payload}`);
         this.protocol.sendPublish(this.replyTo, payload, 0, false, false);
     }
 
     sendUdpMessage(payload, timestamp) {
         if (!this.udp.remoteAddress) {
-            debug(`设备 ${this.clientId} 未连接，无法发送 UDP 消息`);
+            debug(`Device ${this.clientId} is not connected; cannot send UDP message`);
             return;
         }
         this.udp.localSequence++;
@@ -425,13 +433,13 @@ class MQTTConnection {
     }
 
     generateUdpHeader(length, timestamp, sequence) {
-        // 重用预分配的缓冲区
+        // Reuse the preallocated buffer
         this.headerBuffer.writeUInt8(1, 0);
         this.headerBuffer.writeUInt16BE(length, 2);
         this.headerBuffer.writeUInt32BE(this.connectionId, 4);
         this.headerBuffer.writeUInt32BE(timestamp, 8);
         this.headerBuffer.writeUInt32BE(sequence, 12);
-        return Buffer.from(this.headerBuffer); // 返回副本以避免并发问题
+        return Buffer.from(this.headerBuffer); // Return a copy to avoid concurrent access issues
     }
 
     async parseHelloMessage(json) {
@@ -446,15 +454,15 @@ class MQTTConnection {
         }
 
         if (this.bridge) {
-            debug(`${this.clientId} 收到重复 hello 消息，关闭之前的 bridge`);
+            debug(`${this.clientId} received duplicate hello; closing the previous bridge`);
             this.bridge.close();
             await new Promise(resolve => setTimeout(resolve, 100));
         }
         this.bridge = new WebSocketBridge(this, json.version, this.macAddress, this.uuid, this.userData);
         this.bridge.on('close', () => {
             const seconds = (Date.now() - this.udp.startTime) / 1000;
-            console.log(`通话结束: ${this.clientId} Session: ${this.udp.session_id} Duration: ${seconds}s`);
-            // 通话状态下不发送 goodbye 消息
+            console.log(`Call ended: ${this.clientId} Session: ${this.udp.session_id} Duration: ${seconds}s`);
+            // Do not send goodbye while in a device call
             if (!this.server.callManager.isInCall(this.macAddress)) {
                 this.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: this.udp.session_id }));
             }
@@ -465,10 +473,10 @@ class MQTTConnection {
         });
 
         try {
-            console.log(`通话开始: ${this.clientId} Protocol: ${json.version} ${this.bridge.chatServer}`);
+            console.log(`Call started: ${this.clientId} Protocol: ${json.version}`);
 
-            // 设备重新连接AI服务端，清理之前的通话状态
-            // 必须先获取通话session_id，再调用clearDevice（因为clearDevice会删除session_id）
+            // Clear previous call state when the device reconnects to the AI server
+            // Get the call session_id before clearDevice, which deletes it
             const callSessionId = this.server.callManager.getCallSessionId(this.macAddress);
             const clearResult = this.server.callManager.clearDevice(this.macAddress);
             if (clearResult.peerMac) {
@@ -476,7 +484,7 @@ class MQTTConnection {
                 if (peerConn) {
                     const goodbyeSessionId = callSessionId || this.udp.session_id;
                     peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: goodbyeSessionId }));
-                    console.log(`通话状态已清理，已通知对方 ${clearResult.peerMac} 发送 goodbye, session=${goodbyeSessionId}`);
+                    console.log(`Call state cleared; notified peer ${clearResult.peerMac} with goodbye, session=${goodbyeSessionId}`);
                 }
             }
 
@@ -498,7 +506,7 @@ class MQTTConnection {
             }));
         } catch (error) {
             this.sendMqttMessage(JSON.stringify({ type: 'error', message: '处理 hello 消息失败' }));
-            console.error(`${this.clientId} 处理 hello 消息失败: ${error}`);
+            console.error('Failed to handle hello message');
         }
     }
 
@@ -531,7 +539,7 @@ class MQTTConnection {
         }
 
         if (json.type === 'udp_timeout') {
-            console.log(`设备 ${this.clientId} 报告 UDP 接收超时，重置会话`);
+            console.log(`Device ${this.clientId} reported a UDP receive timeout; resetting the session`);
             this.bridge.close();
             this.bridge = null;
             return;
@@ -541,21 +549,21 @@ class MQTTConnection {
     }
 
     onUdpMessage(rinfo, message, payloadLength, timestamp, sequence) {
-        // 检查是否在通话桥接中 - 优先于bridge检查
+        // Check device-call bridging before checking the AI bridge
         if (this.server.callManager.isInCall(this.macAddress)) {
             const peerConn = this.server.callManager.getPeerConnection(this.macAddress);
             const header = message.slice(0, 16);
             const encryptedPayload = message.slice(16, 16 + payloadLength);
 
             try {
-                // 统一解密
+                // Decrypt the payload
                 const decipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
                 const payload = Buffer.concat([decipher.update(encryptedPayload), decipher.final()]);
 
-                // 发送给通话对方或 pending 回声（发给自己）
+                // Forward to the peer, or echo to this device while the call is pending
                 const targetConn = (peerConn && peerConn.udp?.key && peerConn.udp?.remoteAddress) ? peerConn : this;
                 if (targetConn === this) {
-                    // pending 回声：发送OPUS静音帧
+                    // For a pending-call echo, send an OPUS silence frame
                     const silentPayload = generateOpusSilenceFrame();
                     if (silentPayload) {
                         this.sendUdpEncrypted(targetConn, silentPayload);
@@ -565,7 +573,7 @@ class MQTTConnection {
                 }
                 return;
             } catch (e) {
-                console.error(`通话处理失败: ${e.message}`);
+                console.error(`Failed to process call: ${e.message}`);
             }
             return;
         }
@@ -580,7 +588,7 @@ class MQTTConnection {
             return;
         }
 
-        // 处理加密数据
+        // Process encrypted data
         const header = message.slice(0, 16);
         const encryptedPayload = message.slice(16, 16 + payloadLength);
 
@@ -588,11 +596,11 @@ class MQTTConnection {
             const cipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
             const payload = Buffer.concat([cipher.update(encryptedPayload), cipher.final()]);
 
-            console.log(`收到UDP音频数据从${this.clientId}转发到WebSocket，长度: ${payload.length}, 时间戳: ${timestamp}, 序列号: ${sequence}`);
+            console.log(`Forwarding UDP audio from ${this.clientId} to WebSocket, length: ${payload.length}, timestamp: ${timestamp}, sequence: ${sequence}`);
             this.bridge.sendAudio(payload, timestamp);
             this.udp.remoteSequence = sequence;
         } catch (decryptionError) {
-            console.error(`UDP 解密失败: ${decryptionError.message}`, {
+            console.error(`UDP decryption failed: ${decryptionError.message}`, {
                 sequence: sequence,
                 expectedSequence: this.udp.remoteSequence + 1,
                 payloadLength: payloadLength,
@@ -603,7 +611,7 @@ class MQTTConnection {
         }
     }
 
-    // 加密并发送 UDP 消息（targetConn 为对方连接时发给对方，为 this 时发给自己）
+    // Encrypt and send UDP: targetConn selects the peer, or this device when it is this
     sendUdpEncrypted(targetConn, payload) {
         const seq = ++targetConn.udp.localSequence;
         targetConn.headerBuffer.writeUInt8(1, 0);
@@ -656,7 +664,7 @@ class MQTTConnection {
                 this.mcpCachedTools = this.mcpCachedTools.concat(tools);
                 cursor = nextCursor;
             } while (cursor !== undefined);
-            debug('初始化设备工具成功:', this.mcpCachedTools);
+            debug('Device tools initialized:', this.mcpCachedTools);
         } catch (error) {
             debug("Error initializing device tools", error);
         }
@@ -665,7 +673,7 @@ class MQTTConnection {
     sendMcpRequest(method, params, timeout = 10000) {
         const id = this.mcpRequestId++;
         return new Promise((resolve, reject) => {
-            // 设置超时定时器
+            // Set the timeout timer
             const timer = setTimeout(() => {
                 if (this.mcpPendingRequests[id]) {
                     delete this.mcpPendingRequests[id];
@@ -712,21 +720,21 @@ class MQTTServer {
     constructor() {
         this.mqttPort = parseInt(process.env.MQTT_PORT) || 1883;
         this.udpPort = parseInt(process.env.UDP_PORT) || this.mqttPort;
-        this.publicIp = process.env.PUBLIC_IP || 'mqtt.xiaozhi.me';
+        this.publicIp = publicIp;
         this.connections = new Map(); // connectionId -> MQTTConnection
         this.clientIdMap = new Map(); // clientId -> MQTTConnection
         this.keepAliveTimer = null;
-        this.keepAliveCheckInterval = 1000; // 默认每1秒检查一次
+        this.keepAliveCheckInterval = 1000; // Check every 1 second by default
 
         this.headerBuffer = Buffer.alloc(16);
 
-        // 初始化通话管理器
+        // Initialize the call manager
         this.callManager = new CallManager();
         this.callManager.getConnectionByMac = (mac) => this.getConnectionByMac(mac);
     }
 
     generateNewConnectionId() {
-        // 生成一个32位不重复的整数
+        // Generate a unique 32-bit integer
         let id;
         do {
             id = Math.floor(Math.random() * 0xFFFFFFFF);
@@ -737,58 +745,58 @@ class MQTTServer {
     start() {
         this.mqttServer = net.createServer((socket) => {
             const connectionId = this.generateNewConnectionId();
-            debug(`新客户端连接: ${connectionId}`);
+            debug(`New client connection: ${connectionId}`);
             new MQTTConnection(socket, connectionId, this);
         });
 
         this.mqttServer.listen(this.mqttPort, () => {
-            console.warn(`MQTT 服务器正在监听端口 ${this.mqttPort}`);
+            console.warn(`MQTT server listening on port ${this.mqttPort}`);
         });
 
 
         this.udpServer = dgram.createSocket('udp4');
         this.udpServer.on('message', this.onUdpMessage.bind(this));
         this.udpServer.on('error', err => {
-            console.error('UDP 错误', err);
+            console.error('UDP error', err);
             setTimeout(() => { process.exit(1); }, 1000);
         });
         this.udpServer.bind(this.udpPort, () => {
-            console.warn(`UDP 服务器正在监听 ${this.publicIp}:${this.udpPort}`);
+            console.warn(`UDP server listening on ${this.publicIp}:${this.udpPort}`);
         });
 
-        // 启动全局心跳检查定时器
+        // Start the global keep-alive check timer
         this.setupKeepAliveTimer();
     }
 
     /**
-     * 设置全局心跳检查定时器
+     * Set up the global keep-alive check timer
      */
     setupKeepAliveTimer() {
-        // 清除现有定时器
+        // Clear the existing timer
         this.clearKeepAliveTimer();
         this.lastConnectionCount = 0;
         this.lastActiveConnectionCount = 0;
 
-        // 设置新的定时器
+        // Set the new timer
         this.keepAliveTimer = setInterval(() => {
-            // 检查所有连接的心跳状态
+            // Check keep-alive status for all connections
             for (const connection of this.connections.values()) {
                 connection.checkKeepAlive();
             }
 
-            // 清理超时的pending通话
+            // Clean up expired pending calls
             const cleanedCalls = this.callManager.cleanupTimeoutCalls(60000);
             for (const { mac, peerMac } of cleanedCalls) {
                 const conn = this.getConnectionByMac(mac);
                 if (conn) {
                     conn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: conn.udp.session_id }));
-                    console.log(`已发送超时goodbye给 ${mac}`);
+                    console.log(`Sent timeout goodbye to ${mac}`);
                 }
             }
 
             const activeCount = Array.from(this.connections.values()).filter(connection => connection.isAlive()).length;
             if (activeCount !== this.lastActiveConnectionCount || this.connections.size !== this.lastConnectionCount) {
-                console.log(`连接数: ${this.connections.size}, 活跃数: ${activeCount}`);
+                console.log(`Connections: ${this.connections.size}, active: ${activeCount}`);
                 this.lastActiveConnectionCount = activeCount;
                 this.lastConnectionCount = this.connections.size;
             }
@@ -796,7 +804,7 @@ class MQTTServer {
     }
 
     /**
-     * 清除心跳检查定时器
+     * Clear the keep-alive check timer
      */
     clearKeepAliveTimer() {
         if (this.keepAliveTimer) {
@@ -806,31 +814,31 @@ class MQTTServer {
     }
 
     addConnection(connection) {
-        // 检查是否已存在相同 clientId 的连接
+        // Check for an existing connection with the same clientId
         for (const [key, value] of this.connections.entries()) {
             if (value.clientId === connection.clientId) {
-                debug(`${connection.clientId} 已存在连接，关闭旧连接`);
+                debug(`${connection.clientId} already has a connection; closing the old one`);
                 value.close();
             }
         }
         this.connections.set(connection.connectionId, connection);
 
-        // 添加到索引映射中
+        // Add the connection to the lookup map
         if (connection.clientId) {
             this.clientIdMap.set(connection.clientId, connection);
         }
     }
 
     removeConnection(connection) {
-        debug(`关闭连接: ${connection.connectionId}`);
+        debug(`Closing connection: ${connection.connectionId}`);
 
-        // 清理设备通话状态并通知对方
+        // Clear the device's call state and notify its peer
         if (connection.macAddress) {
             const peerConn = this.callManager.getPeerConnection(connection.macAddress);
-            // 必须先获取session_id，再调用clearDevice（因为clearDevice会删除callSessionIds）
+            // Get session_id before clearDevice, which deletes callSessionIds
             const peerSessionId = peerConn ? this.callManager.getCallSessionId(peerConn.macAddress) : null;
             this.callManager.clearDevice(connection.macAddress);
-            // 通知对方通话结束（使用对端的session_id）
+            // Notify the peer that the call ended, using the peer's session_id
             if (peerConn && peerSessionId) {
                 peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: peerSessionId }));
             }
@@ -854,7 +862,7 @@ class MQTTServer {
     onUdpMessage(message, rinfo) {
         // message format: [type: 1u, flag: 1u, payloadLength: 2u, cookie: 4u, timestamp: 4u, sequence: 4u, payload: n]
         if (message.length < 16) {
-            console.warn('收到不完整的 UDP Header', rinfo);
+            console.warn('Received an incomplete UDP header', rinfo);
             return;
         }
 
@@ -874,48 +882,48 @@ class MQTTServer {
 
             connection.onUdpMessage(rinfo, message, payloadLength, timestamp, sequence);
         } catch (error) {
-            console.error('UDP 消息处理错误:', error);
+            console.error('Failed to process UDP message:', error);
         }
     }
 
     /**
-     * 停止服务器
+     * Stop the server
      */
     async stop() {
         if (this.stopping) {
             return;
         }
         this.stopping = true;
-        // 清除心跳检查定时器
+        // Clear the keep-alive check timer
         this.clearKeepAliveTimer();
 
         if (this.connections.size > 0) {
-            console.warn(`等待 ${this.connections.size} 个连接关闭`);
+            console.warn(`Waiting for ${this.connections.size} connections to close`);
             for (const connection of this.connections.values()) {
                 connection.close();
             }
             await new Promise(resolve => setTimeout(resolve, 300));
-            debug('等待连接关闭完成');
+            debug('Finished waiting for connections to close');
             this.connections.clear();
         }
 
         if (this.udpServer) {
             this.udpServer.close();
             this.udpServer = null;
-            console.warn('UDP 服务器已停止');
+            console.warn('UDP server stopped');
         }
 
-        // 关闭MQTT服务器
+        // Close the MQTT server
         if (this.mqttServer) {
             this.mqttServer.close();
             this.mqttServer = null;
-            console.warn('MQTT 服务器已停止');
+            console.warn('MQTT server stopped');
         }
 
         process.exit(0);
     }
 
-    // 通过clientId查找连接
+    // Find a connection by clientId
     getConnectionById(clientId) {
         if (this.clientIdMap.has(clientId)) {
             return this.clientIdMap.get(clientId);
@@ -930,7 +938,7 @@ class MQTTServer {
         return null;
     }
 
-    // 通过MAC地址查找连接
+    // Find a connection by MAC address
     getConnectionByMac(mac) {
         const normalizedMac = mac?.toLowerCase();
         for (const connection of this.connections.values()) {
@@ -941,7 +949,7 @@ class MQTTServer {
         return null;
     }
 
-    // 通过groupId查找连接
+    // Find connections by groupId
     getConnectionsByGroupId(groupId) {
         const connections = [];
         for (const connection of this.connections.values()) {
@@ -953,72 +961,72 @@ class MQTTServer {
     }
 }
 
-// 创建并启动服务器
+// Create and start the server
 const server = new MQTTServer();
 server.start();
 process.on('SIGINT', () => {
-    console.warn('收到 SIGINT 信号，开始关闭');
+    console.warn('Received SIGINT; shutting down');
     server.stop();
 });
 
-// 添加管理API服务，用于向设备下发指令并获取响应
+// Add the management API for device commands and responses
 const express = require('express');
 const app = express();
 const adminPort = process.env.API_PORT || 8007;
 
 app.use(express.json());
 
-// 计算当天的令牌的辅助函数
+// Helper to calculate today's token
 function calculateDailyToken() {
     try {
-        // 获取当前日期（yyyy-MM-dd格式）
+        // Get the current date in yyyy-MM-dd format
         const now = new Date();
         const year = now.getFullYear();
         const month = String(now.getMonth() + 1).padStart(2, '0');
         const day = String(now.getDate()).padStart(2, '0');
         const currentDate = `${year}-${month}-${day}`;
 
-        // 从环境变量获取签名密钥
+        // Read the signing key from the environment
         const signatureKey = process.env.MQTT_SIGNATURE_KEY;
 
-        // 计算令牌
+        // Calculate the token
         const tokenString = currentDate + signatureKey;
         return crypto.createHash('sha256').update(tokenString).digest('hex');
     } catch (error) {
-        console.error('计算令牌失败:', error);
+        console.error('Failed to calculate token:', error);
         throw error;
     }
 }
 
-// 验证Authorization头的中间件
+// Middleware to validate the Authorization header
 function authenticateRequest(req, res, next) {
     try {
-        // 获取Authorization头
+        // Read the Authorization header
         const authHeader = req.headers.authorization;
 
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
             return res.status(401).json({ error: '未提供有效的Authorization头' });
         }
 
-        // 提取token
+        // Extract the token
         const token = authHeader.split(' ')[1];
 
-        // 计算预期的token
+        // Calculate the expected token
         const expectedToken = calculateDailyToken();
 
-        // 验证token
+        // Validate the token
         if (token !== expectedToken) {
             return res.status(401).json({ error: '无效的授权令牌' });
         }
 
-        // 验证通过，继续处理请求
+        // Continue processing after successful validation
         next();
     } catch (error) {
         res.status(401).json({ error: '授权验证失败' });
     }
 }
 
-// 设备指令下发API - 支持MCP指令并返回设备响应
+// Device command API: send MCP commands and return device responses
 app.post('/api/commands/:clientId', authenticateRequest, async (req, res) => {
     try {
         const { clientId } = req.params;
@@ -1028,7 +1036,7 @@ app.post('/api/commands/:clientId', authenticateRequest, async (req, res) => {
             return res.status(500).json({ success: false, error: '设备未连接' });
         }
 
-        // 处理MCP类型的命令
+        // Handle MCP commands
         if (command.type === 'mcp' && command.payload) {
             const { method, params } = command.payload;
             try {
@@ -1047,22 +1055,22 @@ app.post('/api/commands/:clientId', authenticateRequest, async (req, res) => {
             res.status(500).json({ success: false, error: '指令类型无效' });
         }
     } catch (error) {
-        console.error('处理指令下发错误:', error);
+        console.error('Failed to dispatch command:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// 获取指定设备在线状态的API
+// API to query whether specified devices are online
 app.post('/api/devices/status', authenticateRequest, (req, res) => {
     try {
         const { clientIds } = req.body;
 
-        // 验证参数
+        // Validate parameters
         if (!clientIds || !Array.isArray(clientIds)) {
             return res.status(400).json({ error: 'clientIds必须是一个数组' });
         }
 
-        // 构建设备状态map
+        // Build the device status map
         const deviceStatusMap = {};
         clientIds.forEach(clientId => {
             const connection = server.getConnectionById(clientId);
@@ -1074,14 +1082,14 @@ app.post('/api/devices/status', authenticateRequest, (req, res) => {
 
         res.json(deviceStatusMap);
     } catch (error) {
-        console.error('处理设备状态查询错误:', error);
+        console.error('Failed to query device status:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ========== 通话管理 API ==========
+// ========== Call management API ==========
 
-// 发起通话请求（服务端调用）
+// Request a call (invoked by the server)
 app.post('/api/call/request', authenticateRequest, (req, res) => {
     try {
         const { caller_mac, target_mac, caller_nickname } = req.body;
@@ -1090,7 +1098,7 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
             return res.status(400).json({ error: '缺少必要参数: caller_mac, target_mac' });
         }
 
-        // 先检查被叫方是否在线
+        // Check whether the callee is online first
         const targetConn = server.getConnectionByMac(target_mac);
         if (!targetConn) {
             return res.json({
@@ -1099,26 +1107,26 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
             });
         }
 
-        // 在线才发起呼叫
+        // Request a call only when the callee is online
         const result = server.callManager.requestCall(caller_mac, target_mac, caller_nickname);
 
-        // 通话请求成功，断开设备的 bridge，让设备进入通话模式
+        // After a successful call request, disconnect the AI bridge so the device enters call mode
         if (result.status === 'bridged' || result.status === 'pending') {
             const callerConn = server.getConnectionByMac(caller_mac);
-            // 必须在断开bridge前记录session_id，因为断开后device会进入通话模式，session_id会变化
+            // Save session_id before disconnecting the bridge: entering call mode changes it
             const callerSessionId = callerConn?.udp?.session_id;
             if (callerConn?.bridge) {
                 callerConn.bridge.close();
                 callerConn.bridge = null;
-                console.log(`通话请求成功，已断开设备 ${caller_mac} 的 bridge`);
+                console.log(`Call request succeeded; disconnected the bridge for device ${caller_mac}`);
             }
-            // 记录主叫方进入通话模式前的session_id（bridge模式的session）
+            // Save the caller's session_id from bridge mode, before it enters call mode
             if (callerSessionId) {
                 server.callManager.setCallSessionId(caller_mac, callerSessionId);
             }
         }
 
-        // 如果是双向匹配建立桥接，被叫方也已经进入了通话模式，需要记录被叫方的session_id
+        // For mutual-call pairing, the callee has also entered call mode; save its session_id
         if (result.status === 'bridged' && result.peerMac) {
             const targetConn = server.getConnectionByMac(target_mac);
             if (targetConn?.udp?.session_id) {
@@ -1127,7 +1135,7 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
         }
 
         if (result.status === 'pending') {
-            // 远程唤醒被叫方
+            // Wake the callee remotely
             const wakeupMessage = {
                 type: 'mcp',
                 payload: {
@@ -1144,7 +1152,7 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
                 }
             };
             targetConn.sendMqttMessage(JSON.stringify(wakeupMessage));
-            console.log(`已发送远程唤醒给 ${target_mac}: 来自${caller_nickname}的来电`);
+            console.log(`Sent remote wake-up to ${target_mac}: incoming call from ${caller_nickname}`);
         }
 
         res.json({
@@ -1152,12 +1160,12 @@ app.post('/api/call/request', authenticateRequest, (req, res) => {
             message: result.message
         });
     } catch (error) {
-        console.error('处理通话请求错误:', error);
+        console.error('Failed to process call request:', error);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
-// 接听通话请求（被叫方调用）
+// Accept a call (invoked by the callee)
 app.post('/api/call/accept', authenticateRequest, (req, res) => {
     try {
         const { mac } = req.body;
@@ -1169,25 +1177,25 @@ app.post('/api/call/accept', authenticateRequest, (req, res) => {
         const result = server.callManager.joinCall(mac);
 
         if (result.status === 'bridged') {
-            // 获取对方的连接并通知对方通话已建立
+            // Find the peer connection and notify it that the call is established
             const peerMac = result.peerMac;
             const peerConn = server.getConnectionByMac(peerMac);
             if (peerConn) {
                 peerConn.sendMqttMessage(JSON.stringify({ type: 'call_accepted', from: mac }));
             }
-            // 断开设备的 bridge，让设备进入通话模式
+            // Disconnect the AI bridge so the device enters call mode
             const calleeConn = server.getConnectionByMac(mac);
-            // 必须在断开bridge前记录session_id，因为断开后device会进入通话模式，session_id会变化
+            // Save session_id before disconnecting the bridge: entering call mode changes it
             const calleeSessionId = calleeConn?.udp?.session_id;
             const peerSessionId = peerConn?.udp?.session_id;
             if (calleeConn?.bridge) {
                 calleeConn.bridge.close();
                 calleeConn.bridge = null;
-                console.log(`通话接听成功，已断开设备 ${mac} 的 bridge`);
+                console.log(`Call accepted; disconnected the bridge for device ${mac}`);
             }
-            console.log(`通话已建立: ${mac} <-> ${peerMac}`);
+            console.log(`Call established: ${mac} <-> ${peerMac}`);
 
-            // 记录进入通话模式前的session_id（bridge模式的session）
+            // Save the session_id from bridge mode, before entering call mode
             if (calleeSessionId) {
                 server.callManager.setCallSessionId(mac, calleeSessionId);
             }
@@ -1198,57 +1206,43 @@ app.post('/api/call/accept', authenticateRequest, (req, res) => {
 
         res.json(result);
     } catch (error) {
-        console.error('处理接听请求错误:', error);
+        console.error('Failed to process call acceptance:', error);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
-// 计算并打印当天的临时密钥
-function calculateAndPrintDailyToken() {
-    try {
-        // 调用共享的辅助函数计算令牌
-        const dailyToken = calculateDailyToken();
-
-        // 打印令牌信息
-        console.log('API今日临时密钥: Authorization: Bearer ' + dailyToken);
-        return dailyToken;
-    } catch (error) {
-        console.error('计算临时密钥失败:', error);
-    }
-}
-
-// 验证MQTT_SIGNATURE_KEY的密码复杂度
+// Validate MQTT_SIGNATURE_KEY password complexity
 function validateSignatureKeyComplexity() {
     const signatureKey = process.env.MQTT_SIGNATURE_KEY;
 
     if (!signatureKey) {
-        console.error('无法启动管理API服务: 未设置MQTT_SIGNATURE_KEY环境变量');
+        console.error('Cannot start management API: MQTT_SIGNATURE_KEY environment variable is not set');
         return false;
     }
 
-    // 检查长度是否大于等于8位
+    // Check for a length of at least 8 characters
     if (signatureKey.length < 8) {
-        console.error('无法启动管理API服务: MQTT_SIGNATURE_KEY长度必须大于等于8位');
+        console.error('Cannot start management API: MQTT_SIGNATURE_KEY must contain at least 8 characters');
         return false;
     }
 
-    // 检查是否包含大写字母
+    // Check for an uppercase letter
     if (!/[A-Z]/.test(signatureKey)) {
-        console.error('无法启动管理API服务: MQTT_SIGNATURE_KEY必须包含至少一个大写字母');
+        console.error('Cannot start management API: MQTT_SIGNATURE_KEY must contain at least one uppercase letter');
         return false;
     }
 
-    // 检查是否包含小写字母
+    // Check for a lowercase letter
     if (!/[a-z]/.test(signatureKey)) {
-        console.error('无法启动管理API服务: MQTT_SIGNATURE_KEY必须包含至少一个小写字母');
+        console.error('Cannot start management API: MQTT_SIGNATURE_KEY must contain at least one lowercase letter');
         return false;
     }
 
-    // 检查是否包含不允许的字符串
+    // Check for disallowed substrings
     const forbiddenStrings = ['test', '1234', 'admin', 'password', 'qwerty', 'xiaozhi'];
     for (const forbidden of forbiddenStrings) {
         if (signatureKey.toLowerCase().includes(forbidden)) {
-            console.error(`无法启动管理API服务: MQTT_SIGNATURE_KEY不能包含'${forbidden}'弱密码，请更换后重启本服务`);
+            console.error(`Cannot start management API: MQTT_SIGNATURE_KEY contains the weak-password substring '${forbidden}'; change it and restart this service`);
             return false;
         }
     }
@@ -1256,11 +1250,9 @@ function validateSignatureKeyComplexity() {
     return true;
 }
 
-// 启动管理API服务
+// Start the management API
 if (validateSignatureKeyComplexity()) {
     app.listen(adminPort, () => {
-        console.log(`管理API服务启动在端口 ${adminPort}`);
-        // 计算并打印当天的临时密钥
-        calculateAndPrintDailyToken();
+        console.log(`Management API started on port ${adminPort}`);
     });
 }

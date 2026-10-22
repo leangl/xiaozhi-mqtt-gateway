@@ -1,0 +1,139 @@
+{
+  "exceptions": [
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 348,
+      "hash": "ef328a89b559615a3fd24bae55e2d182ba5868c4b2cdb076c05ba610824134fb",
+      "category": "compatibility-literal",
+      "reason": "The peer has left. MQTT goodbye reason sent to the other device. Preserve the wire value for existing clients.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 500,
+      "hash": "044eccfd2a19d34f13b9473fa0fa8effc8dbaab84b226032daf55873509bd70d",
+      "category": "compatibility-literal",
+      "reason": "Failed to handle the hello message. MQTT error.message sent to the device. Preserve the existing error payload.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1000,
+      "hash": "771569e1c761ffcab4a305cd2cf7933263bc939c7b5ef11fd98a67724a9ce37e",
+      "category": "compatibility-literal",
+      "reason": "No valid Authorization header was provided. HTTP 401 error text in authenticateRequest; keep the public API response unchanged.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1011,
+      "hash": "ff48a538a6ce8cc77a38fcaacf3e85a66418b3f47296308c32d5d404e123efab",
+      "category": "compatibility-literal",
+      "reason": "Invalid authorization token. HTTP 401 error text in authenticateRequest; keep the public API response unchanged.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1017,
+      "hash": "da22b38657aa768dd6d37bd1ba49c1f64357c5c45127934fa4709a37610f1f67",
+      "category": "compatibility-literal",
+      "reason": "Authorization validation failed. HTTP 401 catch-path response; keep the public API response unchanged.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1028,
+      "hash": "0ddaa4bdbdd60501c0adea6aa6a0a1f5faedd3fd62aea8d6b40bc9921538da49",
+      "category": "compatibility-literal",
+      "reason": "Device is not connected. HTTP 500 command-dispatch response; management clients consume the error field.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1047,
+      "hash": "dbc3593f722374d589ffc8cfb15f6d5b29c38090bd76c9f6ec3c1971e29f2a9a",
+      "category": "compatibility-literal",
+      "reason": "Invalid command type. HTTP 500 command-dispatch response; preserve the command API payload.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1062,
+      "hash": "5b1ef0fc82e13dc2441900f068c86a7ebc8c7f9b9ad77c1014255afc7931a7c7",
+      "category": "compatibility-literal",
+      "reason": "clientIds must be an array. HTTP 400 device-status response. Preserve clientIds as the request key and the existing error text.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1090,
+      "hash": "10c55e23a75c6b28e4bb3ccee3cacc22b069010b952d4605bb1469a46d229e12",
+      "category": "compatibility-literal",
+      "reason": "Missing required parameters: caller_mac, target_mac. HTTP 400 call-request response. Preserve parameter identifiers and response bytes.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1098,
+      "hash": "eed27cb52f70625792f5c9caec5c30ec622e0d63b1996672f070fa0e051f2058",
+      "category": "compatibility-literal",
+      "reason": "The other device is offline; try again later. Call result with status offline. The Java management client forwards message to the caller's tool result, so keep its Chinese language behavior.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1140,
+      "hash": "16c180d877868f502e33c4a572598583939ff9350a47283220294344fbc0a792",
+      "category": "locale-fixture",
+      "reason": "[device_call] You have an incoming call from <caller_nickname or unknown>. Would you like to answer? The Chinese fallback means unknown. The prefix is a parsed command marker. The Python listener strips [device_call] and sends the remaining text to STT/TTS; retain the entire Chinese speech template and its fallback.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "app.js",
+      "kind": "line",
+      "line": 1166,
+      "hash": "37ef9d1326cf6e115c1fc71c7400f73833e97d20ed5313831121ca362ee6e408",
+      "category": "compatibility-literal",
+      "reason": "Missing required parameter: mac. HTTP 400 call-accept response. Preserve the mac key and existing error payload.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "utils/call-manager.js",
+      "kind": "line",
+      "line": 30,
+      "hash": "866990ca29d003464ac0d4af87ab5ae0db86daab51e430735454f3571bd47427",
+      "category": "compatibility-literal",
+      "reason": "Already in a call. requestCall returns this message with status error. The HTTP call API serializes it and Java forwards it as a user-facing tool result.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "utils/call-manager.js",
+      "kind": "line",
+      "line": 76,
+      "hash": "7e71d949d423671fc48bb3ab4b8c11a8ac5554b88a2b54fd8fd024d3839fb685",
+      "category": "compatibility-literal",
+      "reason": "There is no pending call. joinCall returns this message with status no_pending. The HTTP API forwards the result, so retain the public/localized message.",
+      "companion": "TRANSLATION_NOTES.md"
+    },
+    {
+      "path": "utils/call-manager.js",
+      "kind": "line",
+      "line": 82,
+      "hash": "0ad278fb7f71663c2ebeb673d51d320c6c865fbb97b5a424efd550f63eb48ab7",
+      "category": "compatibility-literal",
+      "reason": "The caller has left or the call has timed out. joinCall returns this message with status caller_gone. Preserve the response consumed by server-side calling tools.",
+      "companion": "TRANSLATION_NOTES.md"
+    }
+  ]
+}
